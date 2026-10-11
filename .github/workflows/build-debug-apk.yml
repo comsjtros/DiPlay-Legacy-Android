@@ -20,7 +20,7 @@ jobs:
           distribution: temurin
           java-version: '25'
 
-      - name: Verify Android build packages
+      - name: Install Android build packages
         shell: bash
         run: |
           sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -29,15 +29,25 @@ jobs:
             exit 1
           fi
           echo "Using Android SDK at $sdk_root"
-          for package in \
-            "$sdk_root/platforms/android-37" \
-            "$sdk_root/build-tools/36.0.0" \
-            "$sdk_root/ndk/25.2.9519653"; do
-            if [[ ! -d "$package" ]]; then
-              echo "Required preinstalled Android SDK package is missing: $package" >&2
-              exit 1
-            fi
-          done
+          sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager" ]]; then
+            sdkmanager="$(find "$sdk_root/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          fi
+          if [[ ! -x "$sdkmanager" ]]; then
+            echo "Could not find sdkmanager under $sdk_root/cmdline-tools." >&2
+            exit 1
+          fi
+          set +e
+          yes | "$sdkmanager" --licenses
+          license_status=${PIPESTATUS[1]}
+          set -e
+          if [[ "$license_status" -ne 0 ]]; then
+            exit "$license_status"
+          fi
+          "$sdkmanager" --install \
+            "platforms;android-37" \
+            "build-tools;36.0.0" \
+            "ndk;25.2.9519653"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
