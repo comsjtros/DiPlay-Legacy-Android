@@ -20,8 +20,24 @@ jobs:
           distribution: temurin
           java-version: '25'
 
-      - name: Install Android build packages
-        run: sdkmanager "platforms;android-37" "build-tools;36.0.0" "ndk;25.2.9519653"
+      - name: Verify Android build packages
+        shell: bash
+        run: |
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$sdk_root" ]]; then
+            echo "Neither ANDROID_HOME nor ANDROID_SDK_ROOT is configured on this runner." >&2
+            exit 1
+          fi
+          echo "Using Android SDK at $sdk_root"
+          for package in \
+            "$sdk_root/platforms/android-37" \
+            "$sdk_root/build-tools/36.0.0" \
+            "$sdk_root/ndk/25.2.9519653"; do
+            if [[ ! -d "$package" ]]; then
+              echo "Required preinstalled Android SDK package is missing: $package" >&2
+              exit 1
+            fi
+          done
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
