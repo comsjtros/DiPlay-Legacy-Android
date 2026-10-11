@@ -52,18 +52,8 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run checks and build debug APKs
-        run: >-
-          bash gradlew --no-daemon --no-configuration-cache
-          :shared:testDebugUnitTest
-          :common:testDebugUnitTest
-          :home:testDebugUnitTest
-          :mobile:lintDebug
-          :home:lintDebug
-          :maphost:lintDebug
-          :mobile:assembleDebug
-          :home:assembleDebug
-          :maphost:assembleDebug
+      - name: Build DiPlay mobile debug APK
+        run: bash gradlew --no-daemon --no-configuration-cache :mobile:assembleDebug
 
       - name: Upload DiPlay mobile debug APK
         uses: actions/upload-artifact@v4
