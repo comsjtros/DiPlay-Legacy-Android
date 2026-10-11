@@ -45,7 +45,7 @@ jobs:
             exit "$license_status"
           fi
           "$sdkmanager" --install \
-            "platforms;android-37" \
+            "platforms;android-37.0" \
             "build-tools;36.0.0" \
             "ndk;25.2.9519653"
 
