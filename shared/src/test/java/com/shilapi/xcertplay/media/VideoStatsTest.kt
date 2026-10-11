@@ -7,7 +7,7 @@ import org.junit.Test
 class VideoStatsTest {
     @Test fun oneSecondReportSeparatesLatencyStagesAndQueuePressure() {
         var now = 1_000_000_000L
-        val stats = VideoStats(label = " test", nanoTime = { now })
+        val stats = VideoStats(label = " test", nanoTime = { now }, log = { _, _ -> })
         stats.onReceived(size = 1200, arrivalNs = now - 5_000_000L)
         stats.onQueueWait(12_000_000L)
         stats.onInputWait(22_000_000L)

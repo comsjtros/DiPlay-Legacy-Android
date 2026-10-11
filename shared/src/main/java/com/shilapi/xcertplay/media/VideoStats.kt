@@ -6,6 +6,7 @@ import android.util.Log
 internal class VideoStats(
     private val label: String = "",
     private val nanoTime: () -> Long = System::nanoTime,
+    private val log: (String, String) -> Unit = { tag, message -> Log.i(tag, message) },
 ) {
     private var windowStartNs = nanoTime()
     private var lastArrivalNs = 0L
@@ -89,7 +90,7 @@ internal class VideoStats(
             submit.summary("submit") + decode.summary("decode") + surface.summary("surface") +
             " late=$late" + delay
         TouchLatencyProbe.maxSendNs = 0
-        Log.i(TAG, line)
+        log(TAG, line)
         resetWindow(now)
         return line
     }

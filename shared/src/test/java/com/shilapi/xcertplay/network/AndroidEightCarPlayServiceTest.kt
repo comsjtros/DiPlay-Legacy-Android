@@ -17,6 +17,7 @@ import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.net.BindException
 import java.net.URL
 
 /** Uses real loopback sockets; this does not simulate iPhone authentication or media streaming. */
@@ -41,10 +42,7 @@ class AndroidEightCarPlayServiceTest {
                 assertFalse((info["hidDevices"] as List<*>).isEmpty())
                 service.detach()
                 assertFalse("Detached on attempt $attempt", service.isAttached())
-                ServerSocket().use { released ->
-                    released.reuseAddress = true
-                    released.bind(InetSocketAddress(address, port))
-                }
+                assertTrue("Port $port was not released after detach", canBindReleasedPort(port))
             }
         } finally { controller.destroy() }
     }
@@ -79,6 +77,22 @@ class AndroidEightCarPlayServiceTest {
         )
         assertTrue("Listener startup: $result", result is CarPlayVpnService.AttachResult.Started)
         return service.boundPort() ?: port
+    }
+
+    private fun canBindReleasedPort(port: Int): Boolean {
+        val deadline = System.nanoTime() + 2_000_000_000L
+        do {
+            try {
+                ServerSocket().use { released ->
+                    released.reuseAddress = true
+                    released.bind(InetSocketAddress(address, port))
+                }
+                return true
+            } catch (_: BindException) {
+                Thread.sleep(25)
+            }
+        } while (System.nanoTime() < deadline)
+        return false
     }
 
     private fun fetchInfo(port: Int): Map<*, *> {
