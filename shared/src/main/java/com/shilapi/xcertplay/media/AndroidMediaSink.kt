@@ -760,6 +760,7 @@ private class VideoDecoder(
     // can hide.
     private val queuedBeforePause = BooleanArray(64)
     private val recentPacedSlots = IntArray(PAUSE_HELD_FRAMES) { -1 }
+    private val surfaceReleaseNanos = ConcurrentHashMap<Long, Long>()
     private var queuedSlot = 0
     // The decoder releases a frame only once later input arrives, so a frame queued before a still-screen
     // gap waits for the next one; such waits are not decode time and are left out of the stats.
@@ -789,9 +790,11 @@ private class VideoDecoder(
     }
 
     fun submit(nalus: ByteArray, senderNanos: Long = 0L, arrivalNanos: Long = 0L) {
-        stats.onReceived(nalus.size)
+        stats.onReceived(nalus.size, arrivalNanos)
         // Pacing runs on the worker, in queue order: callbacks of a replaced stream may still deliver here.
-        queue.offer(VideoJob.Frame(nalus, senderNanos = senderNanos, arrivalNanos = arrivalNanos))
+        val dropped = queue.offer(VideoJob.Frame(nalus, senderNanos = senderNanos, arrivalNanos = arrivalNanos))
+        stats.onDropped(dropped)
+        queue.snapshot().let { stats.onQueueSnapshot(it.frames, it.oldestAgeNs) }
     }
 
     fun setSurface(surface: Surface?) {
@@ -846,9 +849,10 @@ private class VideoDecoder(
                     when (job) {
                         is VideoJob.Config -> configureDecoder(job)
                         is VideoJob.Frame -> {
+                            stats.onQueueWait(System.nanoTime() - job.receivedNs)
                             if (System.nanoTime() - job.receivedNs > MAX_FRAME_AGE_NS) {
-                                queue.discardFrames()
-                                recover("video backlog exceeded 250 ms")
+                                stats.onDropped(queue.discardFrames() + 1)
+                                recover("video backlog exceeded ${MAX_FRAME_AGE_NS / 1_000_000} ms")
                             } else feed(job.nalus, localTimeOf(job))
                         }
                         is VideoJob.SurfaceChanged -> changeSurface(job.surface)
@@ -973,6 +977,13 @@ private class VideoDecoder(
             }
             codec.configure(format, surface, null, 0)
             codec.start()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                codec.setOnFrameRenderedListener({ _, presentationTimeUs, renderedAtNs ->
+                    surfaceReleaseNanos.remove(presentationTimeUs)?.let { releasedAtNs ->
+                        stats.onSurfaceFrameRendered(renderedAtNs - releasedAtNs)
+                    }
+                }, Handler(Looper.getMainLooper()))
+            }
             codec
         } catch (error: Exception) {
             runCatching { candidate?.release() }
@@ -1083,6 +1094,7 @@ private class VideoDecoder(
         if (outputSurface == null) return
         if (annexB.isEmpty()) { recover("invalid video access unit"); return }
         if (!referenceChain.accepts(annexB, config.codec)) {
+            stats.onDropped()
             requestKeyFrameIfDue()
             return
         }
@@ -1095,21 +1107,25 @@ private class VideoDecoder(
                 "video decoder first input avcc=${nalus.size} annexB=${annexB.size}",
             )
         }
+        val inputWaitStartedNs = System.nanoTime()
         val index = VideoInputPump.acquire(
             running = { running }, drain = { drainOutput(codec) },
             dequeue = { codec.dequeueInputBuffer(INPUT_TIMEOUT_US) },
         )
+        stats.onInputWait(System.nanoTime() - inputWaitStartedNs)
         if (index < 0) { recover("video decoder input stalled"); return }
         @Suppress("DEPRECATION")
         val input = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) codec.getInputBuffer(index) else codec.inputBuffers[index]
         checkNotNull(input) { "Decoder input buffer unavailable" }
         input.clear()
         if (annexB.size <= input.remaining()) {
+            val submitStartedNs = System.nanoTime()
             input.put(annexB)
             // A paced frame carries its local time; MediaCodec returns it with the decoded output.
             val presentationUs = if (presentNs > 0) presentNs / 1000 else System.nanoTime() / 1000
             codec.queueInputBuffer(index, 0, annexB.size, presentationUs, 0)
             val queuedNow = System.nanoTime()
+            stats.onInputSubmit(queuedNow - submitStartedNs)
             if (lastQueuedNanos != 0L && queuedNow - lastQueuedNanos > STILL_GAP_NS) resumedAtNanos = queuedNow
             lastQueuedNanos = queuedNow
             queuedPresentationUs[queuedSlot] = presentationUs
@@ -1180,13 +1196,35 @@ private class VideoDecoder(
                         stats.onPacingDelay(delay.nanos)
                         localNs + delay.nanos
                     } else 0L
-                    if (Build.VERSION.SDK_INT >= 21 && targetNs - now in 1..MAX_PACING_AHEAD_NS) {
-                        codec.releaseOutputBuffer(index, targetNs)
-                    } else {
-                        if (shown && delay != null && !heldOverGap && !pauseHeld) stats.onLate()
-                        codec.releaseOutputBuffer(index, render)
+                    if (shown && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        // A Surface may drop stale frames without a render callback; bound this map and
+                        // discard old entries so diagnostics cannot grow for the session lifetime.
+                        if (surfaceReleaseNanos.size >= MAX_PENDING_SURFACE_TIMESTAMPS) {
+                            val expiredBefore = now - SURFACE_CALLBACK_EXPIRY_NS
+                            val expired = surfaceReleaseNanos.entries.iterator()
+                            while (expired.hasNext()) {
+                                if (expired.next().value < expiredBefore) expired.remove()
+                            }
+                            if (surfaceReleaseNanos.size >= MAX_PENDING_SURFACE_TIMESTAMPS) {
+                                surfaceReleaseNanos.entries.minByOrNull { it.value }?.let { surfaceReleaseNanos.remove(it.key, it.value) }
+                            }
+                        }
+                        surfaceReleaseNanos[info.presentationTimeUs] = now
                     }
-                    if (shown) stats.onRendered()
+                    try {
+                        if (Build.VERSION.SDK_INT >= 21 && targetNs - now in 1..MAX_PACING_AHEAD_NS) {
+                            codec.releaseOutputBuffer(index, targetNs)
+                        } else {
+                            if (shown && delay != null && !heldOverGap && !pauseHeld) stats.onLate()
+                            codec.releaseOutputBuffer(index, render)
+                        }
+                    } catch (error: Exception) {
+                        surfaceReleaseNanos.remove(info.presentationTimeUs)
+                        throw error
+                    }
+                    // API 23+ reports actual Surface presentation asynchronously. Older versions
+                    // have no callback, so buffer release is the closest available proxy.
+                    if (shown && Build.VERSION.SDK_INT < Build.VERSION_CODES.M) stats.onRendered()
                     if (shown && !renderedFrameLogged) {
                         renderedFrameLogged = true
                         report("first frame rendered")
@@ -1231,6 +1269,7 @@ private class VideoDecoder(
     private fun releaseDecoder() {
         val codec = decoder
         decoder = null
+        surfaceReleaseNanos.clear()
         if (codec != null) {
             try {
                 codec.stop()
@@ -1249,7 +1288,9 @@ private class VideoDecoder(
         const val TAG = "xcertplay-usb"
         const val MAX_INPUT_SIZE = 8 * 1024 * 1024
         const val INPUT_TIMEOUT_US = 10_000L
-        const val MAX_FRAME_AGE_NS = 250_000_000L
+        const val MAX_FRAME_AGE_NS = 120_000_000L
+        const val MAX_PENDING_SURFACE_TIMESTAMPS = 128
+        const val SURFACE_CALLBACK_EXPIRY_NS = 2_000_000_000L
         // A paced frame more than this ahead is treated as a bad mapping and shown at once.
         const val MAX_PACING_AHEAD_NS = 1_000_000_000L
         // Longer input gaps are a still screen, not decoding work.

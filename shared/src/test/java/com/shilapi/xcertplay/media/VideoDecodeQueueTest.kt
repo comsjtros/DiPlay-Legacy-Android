@@ -64,6 +64,35 @@ class VideoDecodeQueueTest {
         assertEquals(5, (queue.poll(0) as VideoJob.Frame).nalus.size)
         assertNull(queue.poll(0))
     }
+
+    @Test fun staleFrameIsRejectedAndReportsDrop() {
+        val queue = VideoDecodeQueue(maxFrames = 4, maxAgeNs = 100_000_000L)
+        val stale = VideoJob.Frame(byteArrayOf(1), receivedNs = System.nanoTime() - 500_000_000L)
+        assertEquals(1, queue.offer(stale))
+        assertEquals(VideoJob.Resync, queue.poll(0))
+        assertNull(queue.poll(0))
+        assertEquals(VideoDecodeQueue.Snapshot(0, 0L, 0L), queue.snapshot())
+    }
+
+    @Test fun frameOverflowDiscardsBacklogBeforeLatestFrameAndRequestsResync() {
+        val queue = VideoDecodeQueue(maxFrames = 1)
+        queue.offer(VideoJob.Frame(byteArrayOf(1)))
+        val dropped = queue.offer(VideoJob.Frame(byteArrayOf(2)))
+        assertEquals(1, dropped)
+        assertEquals(VideoJob.Resync, queue.poll(0))
+        assertArrayEquals(byteArrayOf(2), (queue.poll(0) as VideoJob.Frame).nalus)
+        assertEquals(0, queue.snapshot().frames)
+    }
+
+    @Test fun queueSnapshotReportsDepthBytesAndOldestAge() {
+        val queue = VideoDecodeQueue(maxFrames = 4)
+        val received = System.nanoTime() - 25_000_000L
+        queue.offer(VideoJob.Frame(byteArrayOf(1, 2, 3), receivedNs = received))
+        val snapshot = queue.snapshot()
+        assertEquals(1, snapshot.frames)
+        assertEquals(3L, snapshot.bytes)
+        assertTrue(snapshot.oldestAgeNs >= 25_000_000L)
+    }
     @Test fun waitingDecoderNeverBlocksFrameProducer() {
         val queue = VideoDecodeQueue()
         val waiting = java.util.concurrent.CountDownLatch(1)
